@@ -25,6 +25,7 @@ type StatsLogger struct {
 	pipe      chan *statsLog
 	cache     map[int64]map[string]int64
 	lastFlush int64
+	writing   bool
 }
 
 func NewStatsLogger(queue rivers.Queue) *StatsLogger {
@@ -63,8 +64,9 @@ func (l *StatsLogger) Bind() {
 
 // Flushes cached stats and closes resources
 func (l *StatsLogger) Destroy() {
-	// wait for 2 seconds to make sure caches are flushed
-	time.Sleep(2 * time.Second)
+	// force flush by moving time 2 seconds ahead
+	now := time.Now().UTC().Unix()
+	l.flush(now + 2)
 
 	// close resources
 	close(l.pipe)
@@ -78,33 +80,41 @@ func (l *StatsLogger) Log(name string, n int64) {
 }
 
 func (l *StatsLogger) startStatsLogger() {
-	writing := false
 	go func() {
 		for s := range l.pipe {
-			now := time.Now().UTC().Unix()
-
-			// if now doesn't have a cache yet, allocate one
-			if _, ok := l.cache[now]; !ok {
-				l.cache[now] = make(map[string]int64)
-			}
-
-			// increment logged stats' value
-			l.cache[now][s.name] += s.value
-
-			// if we have accumulated some stats and
-			// its safe to write, flush the stats cache.
-			if now > l.lastFlush && !writing {
-				writing = true
-				l.flush(now)
-				writing = false
-			}
+			l.updateCache(s)
 		}
 	}()
 }
 
+func (l *StatsLogger) updateCache(s *statsLog) {
+	now := time.Now().UTC().Unix()
+
+	// if now doesn't have a cache yet, allocate one
+	if _, ok := l.cache[now]; !ok {
+		l.cache[now] = make(map[string]int64)
+	}
+
+	// increment logged stats' value
+	l.cache[now][s.name] += s.value
+
+	// if we have accumulated some stats and
+	// its safe to write, flush the stats cache.
+	if now > l.lastFlush && !l.writing {
+		l.flush(now)
+	}
+}
+
 func (l *StatsLogger) flush(now int64) {
+	l.writing = true
+
+	defer func() {
+		l.writing = false
+		l.lastFlush = now
+	}()
+
 	for sec, secCache := range l.cache {
-		// only flush caches older than 2 seconds
+		// Only flush caches older than 2 seconds
 		if sec >= now-1 {
 			continue
 		}
@@ -115,7 +125,7 @@ func (l *StatsLogger) flush(now int64) {
 			l.conn.Send("INCRBY", secKey, value)
 			l.conn.Send("EXPIRE", secKey, STATS_EXPIRY)
 			if _, err := l.conn.Do("EXEC"); err != nil {
-				log.Println("unable to increment flushed stats for %s:", name, err)
+				log.Printf("unable to increment flushed stats for %s: %s\n", name, err)
 				continue
 			}
 		}
@@ -130,5 +140,4 @@ func (l *StatsLogger) flush(now int64) {
 		// delete this second's cache
 		delete(l.cache, sec)
 	}
-	l.lastFlush = now
 }
